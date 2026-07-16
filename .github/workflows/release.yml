@@ -1,0 +1,67 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*' # Trigger workflow when any tag starting with "v" is pushed
+
+permissions:
+  contents: write # Required to create release and upload assets
+
+jobs:
+  build-and-release:
+    name: Build & Release App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Generate Xcode Project
+        run: |
+          python3 generate_xcodeproj.py
+
+      - name: Build Application (Release Configuration)
+        run: |
+          xcodebuild -project HelixPlayer.xcodeproj \
+                     -scheme HelixPlayer \
+                     -configuration Release \
+                     -sdk macosx \
+                     build \
+                     CONFIGURATION_BUILD_DIR=${{ github.workspace }}/build/Release \
+                     CODE_SIGNING_ALLOWED=NO \
+                     CODE_SIGNING_REQUIRED=NO \
+                     CODE_SIGN_IDENTITY=""
+
+      - name: Package App Bundle
+        run: |
+          cd build/Release
+          # Compress the .app bundle into a zip archive named HelixPlayer-<tag>.zip
+          zip -r ../../HelixPlayer-${{ github.ref_name }}.zip HelixPlayer.app
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HelixPlayer-${{ github.ref_name }}.zip
+          name: Release ${{ github.ref_name }}
+          body: |
+            ## HelixPlayer ${{ github.ref_name }}
+            
+            Welcome to the new release of HelixPlayer!
+            
+            ### Installation
+            1. Download the `HelixPlayer-${{ github.ref_name }}.zip` below.
+            2. Double-click to extract the `HelixPlayer.app`.
+            3. Drag it to your `/Applications` folder.
+            
+            *Note: As this build is unsigned, you may need to right-click the app and choose **Open** the first time to bypass macOS Gatekeeper protections.*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
