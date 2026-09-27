@@ -3,10 +3,16 @@ name: Create Release
 on:
   push:
     tags:
-      - 'v*' # Trigger workflow when any tag starting with "v" is pushed
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v1.1.0)'
+        required: true
+        default: 'v1.0.1'
 
 permissions:
-  contents: write # Required to create release and upload assets
+  contents: write
 
 jobs:
   build-and-release:
@@ -14,6 +20,18 @@ jobs:
     runs-on: macos-latest
 
     steps:
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
@@ -22,9 +40,13 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Generate Xcode Project
+      - name: Update Info.plist Version
         run: |
-          python3 generate_xcodeproj.py
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.vars.outputs.version }}" HelixPlayer/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.vars.outputs.version }}" HelixPlayer/Info.plist
+
+      - name: Run Tests
+        run: make test
 
       - name: Build Application (Release Configuration)
         run: |
@@ -42,7 +64,7 @@ jobs:
         run: |
           # 1. Create ZIP
           cd build/Release
-          zip -r ../../HelixPlayer-${{ github.ref_name }}.zip HelixPlayer.app
+          zip -r ../../HelixPlayer-${{ steps.vars.outputs.tag }}.zip HelixPlayer.app
           cd ../..
           
           # 2. Create DMG
@@ -50,33 +72,34 @@ jobs:
           mkdir -p build/DMG
           cp -R build/Release/HelixPlayer.app build/DMG/
           ln -s /Applications build/DMG/Applications
-          hdiutil create -volname "HelixPlayer" -srcfolder build/DMG -ov -format UDZO HelixPlayer-${{ github.ref_name }}.dmg
+          hdiutil create -volname "HelixPlayer" -srcfolder build/DMG -ov -format UDZO HelixPlayer-${{ steps.vars.outputs.tag }}.dmg
           rm -rf build/DMG
 
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.vars.outputs.tag }}
           files: |
-            HelixPlayer-${{ github.ref_name }}.zip
-            HelixPlayer-${{ github.ref_name }}.dmg
-          name: Release ${{ github.ref_name }}
+            HelixPlayer-${{ steps.vars.outputs.tag }}.zip
+            HelixPlayer-${{ steps.vars.outputs.tag }}.dmg
+          name: Release ${{ steps.vars.outputs.tag }}
           body: |
-            ## HelixPlayer ${{ github.ref_name }}
+            ## HelixPlayer ${{ steps.vars.outputs.tag }}
             
             Welcome to the new release of HelixPlayer!
             
             ### Installation (Recommended)
-            1. Download the `HelixPlayer-${{ github.ref_name }}.dmg` below.
+            1. Download `HelixPlayer-${{ steps.vars.outputs.tag }}.dmg` below.
             2. Double-click to open the disk image.
             3. Drag `HelixPlayer.app` into your `Applications` folder.
             
             ### Alternative Installation
-            1. Download the `HelixPlayer-${{ github.ref_name }}.zip` below.
-            2. Double-click to extract the `HelixPlayer.app`.
+            1. Download `HelixPlayer-${{ steps.vars.outputs.tag }}.zip` below.
+            2. Double-click to extract `HelixPlayer.app`.
             3. Drag it to your `/Applications` folder.
             
-            *Note: As this build is unsigned, you may need to right-click the app and choose **Open** the first time to bypass macOS Gatekeeper protections.*
+            *Note: As this build is unsigned, right-click the app and choose **Open** the first time to bypass macOS Gatekeeper protections.*
           draft: false
           prerelease: false
         env:
