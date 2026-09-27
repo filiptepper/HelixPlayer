@@ -186,7 +186,7 @@ public class CoreAudioHelper {
             kAudioAggregateDeviceNameKey: "HelixPlayer Aggregate",
             kAudioAggregateDeviceUIDKey: uniqueUID,
             kAudioAggregateDeviceSubDeviceListKey: subDevices,
-            kAudioAggregateDeviceIsPrivateKey: false // Public
+            kAudioAggregateDeviceIsPrivateKey: true // Private to process
         ]
         
         var aggregateID: AudioDeviceID = 0

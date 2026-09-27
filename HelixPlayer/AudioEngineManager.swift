@@ -3,6 +3,7 @@ import AVFoundation
 import CoreAudio
 import AudioToolbox
 import Combine
+import Accelerate
 
 public class AudioEngineManager: ObservableObject {
     @Published public var isRunning = false
@@ -14,6 +15,7 @@ public class AudioEngineManager: ObservableObject {
     @Published public var statusMessage: String = "Initializing..."
     @Published public var availableDevices: [AudioDevice] = []
     @Published public var isHelixAvailable = true
+    @Published public var micPermissionDenied = false
     
     @Published public var selectedInputDevice: AudioDevice? = nil {
         didSet {
@@ -39,7 +41,7 @@ public class AudioEngineManager: ObservableObject {
             let input = selectedInputDevice
             let output = selectedOutputDevice
             let size = selectedBufferSize
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            audioQueue.async { [weak self] in
                 self?.updateDeviceBufferSize(input: input, output: output, size: size)
             }
         }
@@ -57,6 +59,11 @@ public class AudioEngineManager: ObservableObject {
     private var shouldStartAfterConfig = false
     private var configVersion = 0
     private var activityToken: NSObjectProtocol? = nil
+    
+    private let audioQueue = DispatchQueue(label: "com.helixplayer.audioQueue", qos: .userInitiated)
+    private var meterTimer: Timer?
+    private var rawInputLevel: Float = 0.0
+    private var rawOutputLevel: Float = 0.0
     
     public static let availableBufferSizes: [UInt32] = [32, 64, 128, 256, 512]
     
@@ -98,9 +105,6 @@ public class AudioEngineManager: ObservableObject {
                 return
             }
             
-            // Check if our selected physical input and output devices are still valid and active.
-            // When we create/destroy our programmatic aggregate device, CoreAudio triggers a configuration change.
-            // We must ignore these changes if our selected devices are still present and unchanged.
             let devices = self.availableDevices
             
             if let selectedInput = self.selectedInputDevice {
@@ -137,33 +141,66 @@ public class AudioEngineManager: ObservableObject {
     
     deinit {
         stopEngine()
+        cleanupAggregateDevice()
+        meterTimer?.invalidate()
+    }
+    
+    public func checkAndRequestMicrophoneAccess(completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async {
+                    self.micPermissionDenied = !granted
+                    completion(granted)
+                }
+            }
+        case .denied, .restricted:
+            DispatchQueue.main.async {
+                self.micPermissionDenied = true
+                self.statusMessage = "Microphone access denied in System Settings."
+                completion(false)
+            }
+        @unknown default:
+            completion(false)
+        }
     }
     
     public func startEngine() {
         log("startEngine() called. current status: isRunning=\(isRunning)")
         guard !isRunning else { return }
-        shouldStartAfterConfig = true
         
-        if helixUnit != nil {
-            log("Audio Unit already loaded. Starting engine directly...")
-            do {
-                try engine.start()
-                isRunning = true
-                statusMessage = "Engine active."
-                log("AVAudioEngine started successfully.")
-                
-                activityToken = ProcessInfo.processInfo.beginActivity(
-                    options: [.userInitiated, .idleSystemSleepDisabled],
-                    reason: "Live Audio Hosting"
-                )
-            } catch {
-                statusMessage = "Start failed: \(error.localizedDescription)"
-                log("Failed to start AVAudioEngine: \(error)")
-                isRunning = false
+        checkAndRequestMicrophoneAccess { [weak self] granted in
+            guard let self = self else { return }
+            guard granted else {
+                self.log("Cannot start engine: Microphone permission denied.")
+                return
             }
-        } else {
-            log("No Audio Unit loaded yet. Triggering reconfiguration to load and start...")
-            triggerReconfiguration()
+            
+            self.shouldStartAfterConfig = true
+            
+            if self.helixUnit != nil && (self.selectedInputDevice?.deviceID == self.selectedOutputDevice?.deviceID || self.aggregateDeviceID != nil) {
+                self.log("Audio Unit already loaded. Starting engine directly...")
+                do {
+                    try self.engine.start()
+                    self.isRunning = true
+                    self.statusMessage = "Engine active."
+                    self.startMeterTimer()
+                    self.log("AVAudioEngine started successfully.")
+                    
+                    self.activityToken = ProcessInfo.processInfo.beginActivity(
+                        options: [.userInitiated, .idleSystemSleepDisabled],
+                        reason: "Live Audio Hosting"
+                    )
+                } catch {
+                    self.log("Direct engine start failed: \(error). Reconfiguring graph...")
+                    self.triggerReconfiguration()
+                }
+            } else {
+                self.log("Engine or Audio Unit requires configuration. Triggering reconfiguration...")
+                self.triggerReconfiguration()
+            }
         }
     }
     
@@ -174,16 +211,14 @@ public class AudioEngineManager: ObservableObject {
         
         log("Stopping engine...")
         engine.stop()
-        engine.reset()
         isRunning = false
         statusMessage = "Engine stopped."
+        stopMeterTimer()
         
         if let token = activityToken {
             ProcessInfo.processInfo.endActivity(token)
             activityToken = nil
         }
-        
-        cleanupAggregateDevice()
     }
     
     public func toggleBypass() {
@@ -201,6 +236,7 @@ public class AudioEngineManager: ObservableObject {
             log("Engine was running, updating state on main thread before stopping...")
             isRunning = false
             statusMessage = "Stopping engine..."
+            stopMeterTimer()
             if let token = activityToken {
                 ProcessInfo.processInfo.endActivity(token)
                 activityToken = nil
@@ -217,7 +253,7 @@ public class AudioEngineManager: ObservableObject {
         let bufferSize = selectedBufferSize
         let existingUnit = helixUnit
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        audioQueue.async { [weak self] in
             guard let self = self else { return }
             
             if wasRunning {
@@ -347,7 +383,12 @@ public class AudioEngineManager: ObservableObject {
         
         func configureAndStartEngine(with au: AVAudioUnit) {
             self.log("Attaching Audio Unit to AVAudioEngine...")
-            self.engine.attach(au)
+            if let oldEngine = au.engine, oldEngine !== self.engine {
+                oldEngine.detach(au)
+            }
+            if au.engine !== self.engine {
+                self.engine.attach(au)
+            }
             
             self.log("Querying AVAudioEngine hardware formats...")
             let hardwareInputFormat = self.engine.inputNode.inputFormat(forBus: 0)
@@ -356,14 +397,20 @@ public class AudioEngineManager: ObservableObject {
             self.log("Hardware input format: \(hardwareInputFormat)")
             self.log("Hardware output format: \(hardwareOutputFormat)")
             
-            let sampleRate = hardwareInputFormat.sampleRate > 0 ? hardwareInputFormat.sampleRate : 48000.0
+            let sampleRate = hardwareInputFormat.sampleRate > 0 ? hardwareInputFormat.sampleRate : (hardwareOutputFormat.sampleRate > 0 ? hardwareOutputFormat.sampleRate : 48000.0)
             guard let monoFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
                 sampleRate: sampleRate,
                 channels: 1,
                 interleaved: false
+            ),
+            let stereoFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: sampleRate,
+                channels: 2,
+                interleaved: false
             ) else {
-                self.log("Error: Failed to create mono AVAudioFormat.")
+                self.log("Error: Failed to create audio formats.")
                 DispatchQueue.main.async {
                     self.statusMessage = "Error: Invalid audio format."
                     self.isConfiguring = false
@@ -374,8 +421,11 @@ public class AudioEngineManager: ObservableObject {
             self.log("Connecting nodes: engine.inputNode -> AudioUnit...")
             self.engine.connect(self.engine.inputNode, to: au, format: monoFormat)
             
-            self.log("Connecting nodes: AudioUnit -> engine.outputNode...")
-            self.engine.connect(au, to: self.engine.outputNode, format: hardwareOutputFormat)
+            self.log("Connecting nodes: AudioUnit -> engine.mainMixerNode...")
+            self.engine.connect(au, to: self.engine.mainMixerNode, format: stereoFormat)
+            
+            self.log("Connecting nodes: engine.mainMixerNode -> engine.outputNode...")
+            self.engine.connect(self.engine.mainMixerNode, to: self.engine.outputNode, format: hardwareOutputFormat)
             
             self.log("Installing real-time VU meter taps...")
             self.installMeterTaps()
@@ -404,6 +454,7 @@ public class AudioEngineManager: ObservableObject {
                     if startedSuccessfully {
                         self.isRunning = true
                         self.statusMessage = "Engine active."
+                        self.startMeterTimer()
                         self.activityToken = ProcessInfo.processInfo.beginActivity(
                             options: [.userInitiated, .idleSystemSleepDisabled],
                             reason: "Live Audio Hosting"
@@ -486,26 +537,38 @@ public class AudioEngineManager: ObservableObject {
         }
     }
     
+    private func startMeterTimer() {
+        meterTimer?.invalidate()
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            guard let self = self, self.isRunning else { return }
+            self.inputLevel = self.rawInputLevel
+            self.outputLevel = self.rawOutputLevel
+        }
+    }
+    
+    private func stopMeterTimer() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        inputLevel = 0.0
+        outputLevel = 0.0
+        rawInputLevel = 0.0
+        rawOutputLevel = 0.0
+    }
+
     private func installMeterTaps() {
         let bufferSize: AVAudioFrameCount = 1024
         
         engine.inputNode.removeTap(onBus: 0)
-        engine.outputNode.removeTap(onBus: 0)
+        engine.mainMixerNode.removeTap(onBus: 0)
         
         engine.inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] (buffer, _) in
             guard let self = self else { return }
-            let level = self.calculateRMS(buffer: buffer)
-            DispatchQueue.main.async {
-                self.inputLevel = level
-            }
+            self.rawInputLevel = self.calculateRMS(buffer: buffer)
         }
         
-        engine.outputNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] (buffer, _) in
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] (buffer, _) in
             guard let self = self else { return }
-            let level = self.calculateRMS(buffer: buffer)
-            DispatchQueue.main.async {
-                self.outputLevel = level
-            }
+            self.rawOutputLevel = self.calculateRMS(buffer: buffer)
         }
     }
     
@@ -513,22 +576,17 @@ public class AudioEngineManager: ObservableObject {
         guard let channelData = buffer.floatChannelData else { return 0.0 }
         let channelCount = Int(buffer.format.channelCount)
         let frameLength = Int(buffer.frameLength)
+        guard channelCount > 0, frameLength > 0 else { return 0.0 }
         
-        var sum: Float = 0.0
-        var sampleCount = 0
-        
-        let targetChannel = min(max(0, selectedInputChannel), channelCount - 1)
-        guard targetChannel >= 0 else { return 0.0 }
-        
-        let data = channelData[targetChannel]
-        for i in 0..<frameLength {
-            let val = data[i]
-            sum += val * val
-            sampleCount += 1
+        var maxRms: Float = 0.0
+        for ch in 0..<channelCount {
+            var rms: Float = 0.0
+            vDSP_rmsqv(channelData[ch], 1, &rms, vDSP_Length(frameLength))
+            if rms > maxRms {
+                maxRms = rms
+            }
         }
-        
-        if sampleCount == 0 { return 0.0 }
-        let rms = sqrt(sum / Float(sampleCount))
-        return rms
+        return maxRms
     }
 }
+

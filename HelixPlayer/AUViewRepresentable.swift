@@ -24,7 +24,11 @@ public struct AUViewRepresentable: NSViewControllerRepresentable {
                 if let viewController = vc {
                     containerVC.addChild(viewController)
                     
-                    // Use AutoLayout to ensure the Audio Unit editor expands/shrinks as the host window resizes
+                    let targetSize = viewController.preferredContentSize
+                    if targetSize.width > 0 && targetSize.height > 0 {
+                        containerVC.view.frame.size = targetSize
+                    }
+                    
                     viewController.view.translatesAutoresizingMaskIntoConstraints = false
                     containerVC.view.addSubview(viewController.view)
                     

@@ -12,6 +12,25 @@ struct ContentView: View {
                     .foregroundColor(.primary)
                     .padding(.bottom, 10)
                 
+                // Mic Permission Warning
+                if manager.micPermissionDenied {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Microphone Access Required", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .font(.system(.body, design: .default).weight(.semibold))
+                            .foregroundColor(.orange)
+                        Button("Open Privacy Settings") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .font(.caption2)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.15))
+                    .cornerRadius(6)
+                }
+
                 // Engine Switcher
                 Button(action: {
                     if manager.isRunning {
@@ -23,7 +42,7 @@ struct ContentView: View {
                     HStack {
                         Image(systemName: manager.isRunning ? "stop.fill" : "play.fill")
                         Text(manager.isRunning ? "Stop Engine" : "Start Engine")
-                            .fontWeight(.semibold)
+                            .font(.system(.body, design: .default).weight(.semibold))
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
@@ -32,6 +51,9 @@ struct ContentView: View {
                     .cornerRadius(8)
                 }
                 .buttonStyle(PlainButtonStyle())
+                .keyboardShortcut(.space, modifiers: [])
+                .accessibilityLabel(manager.isRunning ? "Stop Audio Engine" : "Start Audio Engine")
+                .accessibilityHint("Press Space to toggle audio engine")
                 
                 Text(manager.statusMessage)
                     .font(.caption2)
@@ -45,7 +67,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("AUDIO ROUTING")
                         .font(.caption)
-                        .fontWeight(.bold)
+                        .font(.system(.body, design: .default).weight(.bold))
                         .foregroundColor(.secondary)
                     
                     // Input Device
@@ -100,7 +122,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("PERFORMANCE")
                         .font(.caption)
-                        .fontWeight(.bold)
+                        .font(.system(.body, design: .default).weight(.bold))
                         .foregroundColor(.secondary)
                     
                     VStack(alignment: .leading, spacing: 4) {
@@ -126,7 +148,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text("AUDIO LEVELS")
                         .font(.caption)
-                        .fontWeight(.bold)
+                        .font(.system(.body, design: .default).weight(.bold))
                         .foregroundColor(.secondary)
                     
                     VStack(alignment: .leading, spacing: 4) {
@@ -139,6 +161,8 @@ struct ContentView: View {
                         }
                         ProgressView(value: min(1.0, manager.inputLevel * 5.0))
                             .tint(.green)
+                            .accessibilityLabel("Input Audio Level")
+                            .accessibilityValue(String(format: "%.1f dB", 20 * log10(max(0.0001, manager.inputLevel))))
                     }
                     
                     VStack(alignment: .leading, spacing: 4) {
@@ -151,6 +175,8 @@ struct ContentView: View {
                         }
                         ProgressView(value: min(1.0, manager.outputLevel * 5.0))
                             .tint(.blue)
+                            .accessibilityLabel("Output Audio Level")
+                            .accessibilityValue(String(format: "%.1f dB", 20 * log10(max(0.0001, manager.outputLevel))))
                     }
                 }
                 
@@ -162,7 +188,7 @@ struct ContentView: View {
                 }) {
                     Text("PANIC (MUTE ALL)")
                         .font(.caption)
-                        .fontWeight(.bold)
+                        .font(.system(.body, design: .default).weight(.bold))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                         .background(Color.red)
@@ -170,6 +196,8 @@ struct ContentView: View {
                         .cornerRadius(6)
                 }
                 .buttonStyle(PlainButtonStyle())
+                .keyboardShortcut(".", modifiers: [.command])
+                .accessibilityLabel("Panic: Immediately Stop Engine and Mute All Audio")
             }
             .frame(width: 250)
             .padding(20)
@@ -190,7 +218,7 @@ struct ContentView: View {
                             .foregroundColor(.orange)
                         Text("Helix Native Not Found")
                             .font(.title)
-                            .fontWeight(.bold)
+                            .font(.system(.body, design: .default).weight(.bold))
                         Text("HelixPlayer requires the Line 6 Helix Native Audio Unit plugin to function. Please install the plugin and restart the app.")
                             .font(.body)
                             .foregroundColor(.secondary)

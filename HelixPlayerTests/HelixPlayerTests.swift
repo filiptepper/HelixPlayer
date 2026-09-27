@@ -31,4 +31,48 @@ final class HelixPlayerTests: XCTestCase {
         manager.toggleBypass()
         XCTAssertTrue(manager.isBypassed)
     }
+    
+    func testMultiChannelOutputRoutingWithAudioUnit() {
+        let engine = AVAudioEngine()
+        let delayComponent = AudioComponentDescription(
+            componentType: kAudioUnitType_Effect,
+            componentSubType: kAudioUnitSubType_Delay,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        
+        let expectation = self.expectation(description: "AudioUnit instantiated")
+        AVAudioUnit.instantiate(with: delayComponent, options: []) { au, error in
+            XCTAssertNotNil(au)
+            guard let au = au else {
+                expectation.fulfill()
+                return
+            }
+            engine.attach(au)
+            
+            let stereoFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48000, channels: 2, interleaved: false)!
+            let layout = AVAudioChannelLayout(layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | 4)!
+            let fourChannelFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 48000,
+                interleaved: false,
+                channelLayout: layout
+            )
+            
+            engine.connect(au, to: engine.mainMixerNode, format: stereoFormat)
+            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: fourChannelFormat)
+            
+            XCTAssertNoThrow(engine.prepare())
+            do {
+                try engine.start()
+                engine.stop()
+            } catch {
+                XCTFail("Failed to start engine: \(error)")
+            }
+            expectation.fulfill()
+        }
+        
+        wait(for: [expectation], timeout: 5.0)
+    }
 }
