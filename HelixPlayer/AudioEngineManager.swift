@@ -5,6 +5,225 @@ import AudioToolbox
 import Combine
 import Accelerate
 
+// Lock-free single-producer single-consumer ring buffer for low-latency audio streaming
+final class AudioRingBuffer {
+    private let capacity: Int
+    private let buffer: UnsafeMutablePointer<Float>
+    private var writeHead: Int = 0
+    private var readHead: Int = 0
+    
+    init(capacity: Int = 16384) {
+        self.capacity = capacity
+        self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacity)
+        self.buffer.initialize(repeating: 0, count: capacity)
+    }
+    
+    deinit {
+        buffer.deallocate()
+    }
+    
+    func reset() {
+        writeHead = 0
+        readHead = 0
+        buffer.initialize(repeating: 0, count: capacity)
+    }
+    
+    func availableToRead() -> Int {
+        let w = writeHead
+        let r = readHead
+        if w >= r {
+            return w - r
+        } else {
+            return capacity - (r - w)
+        }
+    }
+    
+    func write(from ptr: UnsafePointer<Float>, count: Int) {
+        var w = writeHead
+        for i in 0..<count {
+            buffer[w] = ptr[i]
+            w = (w + 1) % capacity
+        }
+        writeHead = w
+    }
+    
+    func read(into ptr: UnsafeMutablePointer<Float>, count: Int) {
+        let avail = availableToRead()
+        // Clock drift protection: if latency accumulates past ~42ms (2048 samples at 48kHz),
+        // adjust read head forward to keep latency bounded to ~5.3ms (256 samples).
+        if avail > 2048 {
+            var newR = writeHead - 256
+            if newR < 0 { newR += capacity }
+            readHead = newR
+        }
+        
+        let validAvail = availableToRead()
+        let toRead = min(validAvail, count)
+        var r = readHead
+        for i in 0..<toRead {
+            ptr[i] = buffer[r]
+            r = (r + 1) % capacity
+        }
+        readHead = r
+        
+        if toRead < count {
+            for i in toRead..<count {
+                ptr[i] = 0
+            }
+        }
+    }
+}
+
+// Dedicated CoreAudio HAL input capturer running on its own independent stream
+final class AudioInputCapturer {
+    private var unit: AudioUnit?
+    private let ringBuffer: AudioRingBuffer
+    private let onRMSUpdate: ((Float) -> Void)?
+    
+    private var bufferList: AudioBufferList
+    private let sampleBuffer: UnsafeMutablePointer<Float>
+    private let maxFrames: UInt32 = 4096
+    
+    init(
+        deviceID: AudioDeviceID,
+        inputChannel: Int,
+        sampleRate: Float64,
+        bufferSize: UInt32,
+        ringBuffer: AudioRingBuffer,
+        onRMSUpdate: ((Float) -> Void)?
+    ) throws {
+        self.ringBuffer = ringBuffer
+        self.onRMSUpdate = onRMSUpdate
+        
+        self.sampleBuffer = UnsafeMutablePointer<Float>.allocate(capacity: Int(maxFrames))
+        self.bufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: 1,
+                mDataByteSize: maxFrames * UInt32(MemoryLayout<Float>.size),
+                mData: sampleBuffer
+            )
+        )
+        
+        var desc = AudioComponentDescription(
+            componentType: kAudioUnitType_Output,
+            componentSubType: kAudioUnitSubType_HALOutput,
+            componentManufacturer: kAudioUnitManufacturer_Apple,
+            componentFlags: 0,
+            componentFlagsMask: 0
+        )
+        
+        guard let comp = AudioComponentFindNext(nil, &desc) else {
+            throw NSError(domain: "AudioInputCapturer", code: -1, userInfo: [NSLocalizedDescriptionKey: "HALOutput component not found"])
+        }
+        
+        var unit: AudioUnit?
+        var status = AudioComponentInstanceNew(comp, &unit)
+        guard let unit = unit, status == noErr else {
+            throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to create AudioComponentInstance (\(status))"])
+        }
+        self.unit = unit
+        
+        // 1. Enable input (bus 1)
+        var enableIO: UInt32 = 1
+        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to enable input IO"]) }
+        
+        // 2. Disable output (bus 0)
+        enableIO = 0
+        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to disable output IO"]) }
+        
+        // 3. Set device
+        var devID = deviceID
+        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &devID, UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to set input device (\(status))"]) }
+        
+        // 4. Set stream format (bus 1 output scope)
+        var streamDesc = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: 4,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: 4,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        status = AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &streamDesc, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to set stream format (\(status))"]) }
+        
+        // 5. Set channel map
+        var channelMap = [Int32(inputChannel)]
+        let channelMapSize = UInt32(MemoryLayout<Int32>.size * channelMap.count)
+        _ = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Input, 1, &channelMap, channelMapSize)
+        
+        // 6. Set buffer size
+        var bufSize = bufferSize
+        _ = AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &bufSize, UInt32(MemoryLayout<UInt32>.size))
+        
+        // 7. Set input callback
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        var callbackStruct = AURenderCallbackStruct(
+            inputProc: { (inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData) -> OSStatus in
+                let capturer = Unmanaged<AudioInputCapturer>.fromOpaque(inRefCon).takeUnretainedValue()
+                return capturer.renderCallback(ioActionFlags: ioActionFlags, inTimeStamp: inTimeStamp, inNumberFrames: inNumberFrames)
+            },
+            inputProcRefCon: selfPtr
+        )
+        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &callbackStruct, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to set input callback (\(status))"]) }
+        
+        // 8. Initialize
+        status = AudioUnitInitialize(unit)
+        guard status == noErr else { throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "Failed to initialize AudioUnit (\(status))"]) }
+    }
+    
+    deinit {
+        stop()
+        if let u = unit {
+            AudioUnitUninitialize(u)
+            AudioComponentInstanceDispose(u)
+        }
+        sampleBuffer.deallocate()
+    }
+    
+    func start() throws {
+        guard let u = unit else { return }
+        let status = AudioOutputUnitStart(u)
+        guard status == noErr else {
+            throw NSError(domain: "AudioInputCapturer", code: Int(status), userInfo: [NSLocalizedDescriptionKey: "AudioOutputUnitStart failed (\(status))"])
+        }
+    }
+    
+    func stop() {
+        guard let u = unit else { return }
+        AudioOutputUnitStop(u)
+    }
+    
+    private func renderCallback(
+        ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        inTimeStamp: UnsafePointer<AudioTimeStamp>,
+        inNumberFrames: UInt32
+    ) -> OSStatus {
+        guard let u = unit else { return noErr }
+        let framesToRender = min(inNumberFrames, maxFrames)
+        bufferList.mBuffers.mDataByteSize = framesToRender * UInt32(MemoryLayout<Float>.size)
+        
+        let err = AudioUnitRender(u, ioActionFlags, inTimeStamp, 1, framesToRender, &bufferList)
+        guard err == noErr else { return err }
+        
+        ringBuffer.write(from: sampleBuffer, count: Int(framesToRender))
+        
+        var rms: Float = 0.0
+        vDSP_rmsqv(sampleBuffer, 1, &rms, vDSP_Length(framesToRender))
+        onRMSUpdate?(rms)
+        
+        return noErr
+    }
+}
+
 public class AudioEngineManager: ObservableObject {
     @Published public var isRunning = false
     @Published public var inputLevel: Float = 0.0
@@ -54,6 +273,10 @@ public class AudioEngineManager: ObservableObject {
     }
     
     private var engine = AVAudioEngine()
+    private var sourceNode: AVAudioSourceNode?
+    private var inputCapturer: AudioInputCapturer?
+    private let ringBuffer = AudioRingBuffer(capacity: 16384)
+    
     private var aggregateDeviceID: AudioDeviceID? = nil
     private var isConfiguring = false
     private var shouldStartAfterConfig = false
@@ -180,14 +403,15 @@ public class AudioEngineManager: ObservableObject {
             
             self.shouldStartAfterConfig = true
             
-            if self.helixUnit != nil && (self.selectedInputDevice?.deviceID == self.selectedOutputDevice?.deviceID || self.aggregateDeviceID != nil) {
-                self.log("Audio Unit already loaded. Starting engine directly...")
+            if self.helixUnit != nil && self.inputCapturer != nil {
+                self.log("Audio Unit and Input Capturer already ready. Starting engine directly...")
                 do {
                     try self.engine.start()
+                    try self.inputCapturer?.start()
                     self.isRunning = true
                     self.statusMessage = "Engine active."
                     self.startMeterTimer()
-                    self.log("AVAudioEngine started successfully.")
+                    self.log("AVAudioEngine and InputCapturer started successfully.")
                     
                     self.activityToken = ProcessInfo.processInfo.beginActivity(
                         options: [.userInitiated, .idleSystemSleepDisabled],
@@ -209,8 +433,9 @@ public class AudioEngineManager: ObservableObject {
         shouldStartAfterConfig = false
         guard isRunning else { return }
         
-        log("Stopping engine...")
+        log("Stopping engine and input capturer...")
         engine.stop()
+        inputCapturer?.stop()
         isRunning = false
         statusMessage = "Engine stopped."
         stopMeterTimer()
@@ -259,9 +484,11 @@ public class AudioEngineManager: ObservableObject {
             if wasRunning {
                 self.log("Stopping hardware engine in background...")
                 self.engine.stop()
+                self.inputCapturer?.stop()
                 self.engine.reset()
             }
             
+            self.inputCapturer = nil
             self.cleanupAggregateDevice()
             
             self.setupAudioGraphAsync(
@@ -278,8 +505,18 @@ public class AudioEngineManager: ObservableObject {
     private func updateDeviceBufferSize(input: AudioDevice?, output: AudioDevice?, size: UInt32) {
         log("Updating device buffer sizes to \(size)...")
         if let device = output {
-            let success = CoreAudioHelper.setBufferSize(deviceID: device.deviceID, size: size)
-            log("Set output device \(device.name) buffer size success: \(success)")
+            if device.isMultiOutput {
+                let subUIDs = CoreAudioHelper.getSubDeviceUIDs(for: device.deviceID)
+                for subUID in subUIDs {
+                    if let subDevID = CoreAudioHelper.getDeviceID(for: subUID) {
+                        let success = CoreAudioHelper.setBufferSize(deviceID: subDevID, size: size)
+                        log("Set subdevice \(subUID) buffer size success: \(success)")
+                    }
+                }
+            } else {
+                let success = CoreAudioHelper.setBufferSize(deviceID: device.deviceID, size: size)
+                log("Set output device \(device.name) buffer size success: \(success)")
+            }
         }
         if let device = input {
             let success = CoreAudioHelper.setBufferSize(deviceID: device.deviceID, size: size)
@@ -306,6 +543,7 @@ public class AudioEngineManager: ObservableObject {
     ) {
         log("setupAudioGraphAsync() started for Version: \(version)")
         engine = AVAudioEngine()
+        ringBuffer.reset()
         cleanupAggregateDevice()
         
         guard let input = input, let output = output else {
@@ -317,21 +555,11 @@ public class AudioEngineManager: ObservableObject {
             return
         }
         
-        log("Configuring routing: Input=\(input.name), Output=\(output.name)")
-        var targetDeviceID = output.deviceID
+        log("Configuring routing: Input=\(input.name) (ID \(input.deviceID)), Output=\(output.name) (ID \(output.deviceID))")
         
-        if input.deviceID != output.deviceID {
-            log("Input and Output physical devices are different. Creating programmatic aggregate device...")
-            if let aggregateID = CoreAudioHelper.createAggregateDevice(inputUID: input.uid, outputUID: output.uid) {
-                self.aggregateDeviceID = aggregateID
-                targetDeviceID = aggregateID
-                log("Successfully created aggregate device. New ID: \(aggregateID)")
-            } else {
-                log("Failed to create aggregate device. Falling back to direct output routing.")
-            }
-        } else {
-            log("Input and Output are on the same physical device ID \(output.deviceID). Skipping aggregate device.")
-        }
+        // Output device is directly assigned to AVAudioEngine outputNode HAL unit
+        let targetDeviceID = output.deviceID
+        let totalOutputChannels = CoreAudioHelper.getChannelCount(deviceID: targetDeviceID, isInput: false)
         
         if let outputUnit = engine.outputNode.audioUnit {
             var deviceID = targetDeviceID
@@ -346,40 +574,64 @@ public class AudioEngineManager: ObservableObject {
                 deviceSize
             )
             log("AudioUnitSetProperty CurrentDevice status code: \(status)")
+            
+            // Output Channel Mapping: ensure stereo out goes to all speaker/headphone pairs
+            if totalOutputChannels > 0 {
+                var channelMap = [Int32](repeating: -1, count: totalOutputChannels)
+                if output.isMultiOutput {
+                    // Mirror stereo (Left=0, Right=1) to each stereo pair across all subdevices
+                    for ch in stride(from: 0, through: totalOutputChannels - 2, by: 2) {
+                        channelMap[ch] = 0     // Left
+                        channelMap[ch + 1] = 1 // Right
+                    }
+                } else {
+                    if totalOutputChannels >= 2 {
+                        channelMap[0] = 0
+                        channelMap[1] = 1
+                    } else if totalOutputChannels == 1 {
+                        channelMap[0] = 0
+                    }
+                }
+                let channelMapSize = UInt32(MemoryLayout<Int32>.size * channelMap.count)
+                let mapStatus = AudioUnitSetProperty(
+                    outputUnit,
+                    kAudioOutputUnitProperty_ChannelMap,
+                    kAudioUnitScope_Output,
+                    0,
+                    &channelMap,
+                    channelMapSize
+                )
+                log("AudioUnitSetProperty ChannelMap (outputNode) status code: \(mapStatus), map: \(channelMap)")
+            }
         } else {
             log("Error: engine.outputNode.audioUnit is nil, cannot set hardware device ID.")
         }
         
-        if let inputUnit = engine.inputNode.audioUnit {
-            var deviceID = targetDeviceID
-            let deviceSize = UInt32(MemoryLayout<AudioDeviceID>.size)
-            log("Setting current device ID \(deviceID) on inputNode HAL AudioUnit...")
-            let status = AudioUnitSetProperty(
-                inputUnit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &deviceID,
-                deviceSize
-            )
-            log("AudioUnitSetProperty CurrentDevice (inputNode) status code: \(status)")
-            
-            var channelMap: [Int32] = [Int32(inputChannel)]
-            let channelMapSize = UInt32(MemoryLayout<Int32>.size * channelMap.count)
-            let mapStatus = AudioUnitSetProperty(
-                inputUnit,
-                kAudioOutputUnitProperty_ChannelMap,
-                kAudioUnitScope_Input,
-                1,
-                &channelMap,
-                channelMapSize
-            )
-            log("AudioUnitSetProperty ChannelMap (inputNode) status code: \(mapStatus)")
-        } else {
-            log("Error: engine.inputNode.audioUnit is nil, cannot set hardware device ID.")
-        }
-        
         updateDeviceBufferSize(input: input, output: output, size: bufferSize)
+        
+        let sampleRate: Float64 = (output.sampleRate > 0) ? output.sampleRate : 48000.0
+        
+        // Initialize dedicated low-latency CoreAudio input capturer
+        do {
+            self.inputCapturer = try AudioInputCapturer(
+                deviceID: input.deviceID,
+                inputChannel: inputChannel,
+                sampleRate: sampleRate,
+                bufferSize: bufferSize,
+                ringBuffer: self.ringBuffer,
+                onRMSUpdate: { [weak self] rms in
+                    self?.rawInputLevel = rms
+                }
+            )
+            log("AudioInputCapturer initialized successfully.")
+        } catch {
+            log("Failed to initialize AudioInputCapturer: \(error)")
+            DispatchQueue.main.async {
+                self.statusMessage = "Input init failed: \(error.localizedDescription)"
+                self.isConfiguring = false
+            }
+            return
+        }
         
         func configureAndStartEngine(with au: AVAudioUnit) {
             self.log("Attaching Audio Unit to AVAudioEngine...")
@@ -391,13 +643,9 @@ public class AudioEngineManager: ObservableObject {
             }
             
             self.log("Querying AVAudioEngine hardware formats...")
-            let hardwareInputFormat = self.engine.inputNode.inputFormat(forBus: 0)
             let hardwareOutputFormat = self.engine.outputNode.outputFormat(forBus: 0)
-            
-            self.log("Hardware input format: \(hardwareInputFormat)")
             self.log("Hardware output format: \(hardwareOutputFormat)")
             
-            let sampleRate = hardwareInputFormat.sampleRate > 0 ? hardwareInputFormat.sampleRate : (hardwareOutputFormat.sampleRate > 0 ? hardwareOutputFormat.sampleRate : 48000.0)
             guard let monoFormat = AVAudioFormat(
                 commonFormat: .pcmFormatFloat32,
                 sampleRate: sampleRate,
@@ -418,20 +666,55 @@ public class AudioEngineManager: ObservableObject {
                 return
             }
             
-            self.log("Connecting nodes: engine.inputNode -> AudioUnit...")
-            self.engine.connect(self.engine.inputNode, to: au, format: monoFormat)
+            // Create AVAudioSourceNode pulling from the lock-free ring buffer
+            let sourceNode = AVAudioSourceNode(format: monoFormat) { [weak ringBuffer = self.ringBuffer] _, _, frameCount, audioBufferList -> OSStatus in
+                guard let ringBuffer = ringBuffer else { return noErr }
+                let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
+                if let buffer = abl.first, let ptr = buffer.mData?.assumingMemoryBound(to: Float.self) {
+                    ringBuffer.read(into: ptr, count: Int(frameCount))
+                }
+                return noErr
+            }
+            self.sourceNode = sourceNode
+            self.engine.attach(sourceNode)
+            
+            self.log("Connecting nodes: sourceNode -> AudioUnit...")
+            self.engine.connect(sourceNode, to: au, format: monoFormat)
             
             self.log("Connecting nodes: AudioUnit -> engine.mainMixerNode...")
             self.engine.connect(au, to: self.engine.mainMixerNode, format: stereoFormat)
             
             self.log("Connecting nodes: engine.mainMixerNode -> engine.outputNode...")
-            self.engine.connect(self.engine.mainMixerNode, to: self.engine.outputNode, format: hardwareOutputFormat)
+            let outFormat = hardwareOutputFormat.channelCount > 0 ? hardwareOutputFormat : stereoFormat
+            self.engine.connect(self.engine.mainMixerNode, to: self.engine.outputNode, format: outFormat)
             
             self.log("Installing real-time VU meter taps...")
             self.installMeterTaps()
             
             self.log("Preparing AVAudioEngine...")
             self.engine.prepare()
+            
+            // Re-assert channel map after prepare() to guarantee AUHAL does not reset to default 1:1 map
+            if let outputUnit = self.engine.outputNode.audioUnit, totalOutputChannels > 0 {
+                var channelMap = [Int32](repeating: -1, count: totalOutputChannels)
+                if output.isMultiOutput {
+                    for ch in stride(from: 0, through: totalOutputChannels - 2, by: 2) {
+                        channelMap[ch] = 0
+                        channelMap[ch + 1] = 1
+                    }
+                } else {
+                    if totalOutputChannels >= 2 {
+                        channelMap[0] = 0
+                        channelMap[1] = 1
+                    } else if totalOutputChannels == 1 {
+                        channelMap[0] = 0
+                    }
+                }
+                let mapSize = UInt32(MemoryLayout<Int32>.size * channelMap.count)
+                _ = AudioUnitSetProperty(outputUnit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Output, 0, &channelMap, mapSize)
+                _ = AudioUnitSetProperty(outputUnit, kAudioOutputUnitProperty_ChannelMap, kAudioUnitScope_Global, 0, &channelMap, mapSize)
+                self.log("Post-prepare channelMap asserted: \(channelMap)")
+            }
             
             var startedSuccessfully = false
             var startErrorMsg: String? = nil
@@ -440,11 +723,12 @@ public class AudioEngineManager: ObservableObject {
                 self.log("Start engine flag is active. Starting engine now...")
                 do {
                     try self.engine.start()
+                    try self.inputCapturer?.start()
                     startedSuccessfully = true
-                    self.log("AVAudioEngine started successfully.")
+                    self.log("AVAudioEngine and InputCapturer started successfully.")
                 } catch {
                     startErrorMsg = error.localizedDescription
-                    self.log("Failed to start AVAudioEngine: \(error)")
+                    self.log("Failed to start audio engine: \(error)")
                 }
             }
             
@@ -557,15 +841,7 @@ public class AudioEngineManager: ObservableObject {
 
     private func installMeterTaps() {
         let bufferSize: AVAudioFrameCount = 1024
-        
-        engine.inputNode.removeTap(onBus: 0)
         engine.mainMixerNode.removeTap(onBus: 0)
-        
-        engine.inputNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] (buffer, _) in
-            guard let self = self else { return }
-            self.rawInputLevel = self.calculateRMS(buffer: buffer)
-        }
-        
         engine.mainMixerNode.installTap(onBus: 0, bufferSize: bufferSize, format: nil) { [weak self] (buffer, _) in
             guard let self = self else { return }
             self.rawOutputLevel = self.calculateRMS(buffer: buffer)
@@ -589,4 +865,3 @@ public class AudioEngineManager: ObservableObject {
         return maxRms
     }
 }
-

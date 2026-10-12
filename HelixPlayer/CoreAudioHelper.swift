@@ -9,6 +9,9 @@ public struct AudioDevice: Identifiable, Hashable {
     public let inputChannels: Int
     public let outputChannels: Int
     public let sampleRate: Double
+    public var isMultiOutput: Bool {
+        uid.hasPrefix("~:AMS2_StackedOutput")
+    }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(deviceID)
@@ -85,7 +88,7 @@ public class CoreAudioHelper {
         return devices
     }
     
-    private static func getChannelCount(deviceID: AudioDeviceID, isInput: Bool) -> Int {
+    public static func getChannelCount(deviceID: AudioDeviceID, isInput: Bool) -> Int {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
             mScope: isInput ? kAudioDevicePropertyScopeInput : kAudioDevicePropertyScopeOutput,
@@ -169,17 +172,115 @@ public class CoreAudioHelper {
         }
     }
     
+    public static func getDeviceID(for uid: String) -> AudioDeviceID? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: 0
+        )
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size)
+        guard status == noErr else { return nil }
+        
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
+        status = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceIDs)
+        guard status == noErr else { return nil }
+        
+        for deviceID in deviceIDs {
+            var uidAddress = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: 0
+            )
+            var uidCF: CFString = "" as CFString
+            var uidSize = UInt32(MemoryLayout<CFString>.size)
+            if AudioObjectGetPropertyData(deviceID, &uidAddress, 0, nil, &uidSize, &uidCF) == noErr {
+                if (uidCF as String) == uid {
+                    return deviceID
+                }
+            }
+        }
+        return nil
+    }
+    
+    public static func getSubDeviceUIDs(for deviceID: AudioDeviceID) -> [String] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioObjectPropertyOwnedObjects,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        let status = AudioObjectGetPropertyDataSize(deviceID, &addr, 0, nil, &size)
+        guard status == noErr && size > 0 else { return [] }
+        
+        let count = Int(size) / MemoryLayout<AudioObjectID>.size
+        var objectIDs = [AudioObjectID](repeating: 0, count: count)
+        let err = AudioObjectGetPropertyData(deviceID, &addr, 0, nil, &size, &objectIDs)
+        guard err == noErr else { return [] }
+        
+        var uids: [String] = []
+        for objID in objectIDs {
+            var classID: AudioClassID = 0
+            var classSize = UInt32(MemoryLayout<AudioClassID>.size)
+            var classAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioObjectPropertyClass,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            if AudioObjectGetPropertyData(objID, &classAddr, 0, nil, &classSize, &classID) == noErr {
+                // 'asub' = 0x61737562 (kAudioSubDeviceClassID)
+                if classID == 0x61737562 {
+                    var uidAddr = AudioObjectPropertyAddress(
+                        mSelector: kAudioDevicePropertyDeviceUID,
+                        mScope: kAudioObjectPropertyScopeGlobal,
+                        mElement: kAudioObjectPropertyElementMain
+                    )
+                    var cfStr: Unmanaged<CFString>?
+                    var strSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+                    if AudioObjectGetPropertyData(objID, &uidAddr, 0, nil, &strSize, &cfStr) == noErr,
+                       let uid = cfStr?.takeRetainedValue() as String? {
+                        uids.append(uid)
+                    }
+                }
+            }
+        }
+        return uids
+    }
+    
     public static func createAggregateDevice(inputUID: String, outputUID: String) -> AudioDeviceID? {
-        let subDevices: [[String: Any]] = [
+        var outputUIDs: [String] = []
+        if outputUID.hasPrefix("~:AMS2_StackedOutput") {
+            if let outDeviceID = getDeviceID(for: outputUID) {
+                outputUIDs = getSubDeviceUIDs(for: outDeviceID)
+            }
+            if outputUIDs.isEmpty {
+                print("[CoreAudioHelper] Unable to unpack subdevices for Multi-Output device (\(outputUID)).")
+                return nil
+            }
+            print("[CoreAudioHelper] Unpacked Multi-Output device into subdevices: \(outputUIDs)")
+        } else {
+            outputUIDs = [outputUID]
+        }
+        
+        // Always place inputUID as the first subdevice (index 0) so that:
+        // 1. Selected input channels match inputUID starting at channel 0
+        // 2. The physical input device acts as clock master (drift = 0)
+        var subDevices: [[String: Any]] = [
             [
                 kAudioSubDeviceUIDKey: inputUID,
-                kAudioSubDeviceDriftCompensationKey: 1
-            ],
-            [
-                kAudioSubDeviceUIDKey: outputUID,
-                kAudioSubDeviceDriftCompensationKey: 0 // Clock master
+                kAudioSubDeviceDriftCompensationKey: 0
             ]
         ]
+        
+        for uid in outputUIDs {
+            if uid != inputUID {
+                subDevices.append([
+                    kAudioSubDeviceUIDKey: uid,
+                    kAudioSubDeviceDriftCompensationKey: 1
+                ])
+            }
+        }
         
         let uniqueUID = "com.helixplayer.aggregate.\(UUID().uuidString)"
         let desc: [String: Any] = [

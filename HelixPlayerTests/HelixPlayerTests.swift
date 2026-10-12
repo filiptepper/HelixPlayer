@@ -75,4 +75,50 @@ final class HelixPlayerTests: XCTestCase {
         
         wait(for: [expectation], timeout: 5.0)
     }
+    
+    func testMultiOutputDetection() {
+        let multiOutput = AudioDevice(
+            deviceID: 999,
+            name: "OBS Recorder",
+            uid: "~:AMS2_StackedOutput:0",
+            inputChannels: 0,
+            outputChannels: 2,
+            sampleRate: 48000
+        )
+        let standardDevice = AudioDevice(
+            deviceID: 998,
+            name: "BlackHole 2ch",
+            uid: "BlackHole2ch_UID",
+            inputChannels: 2,
+            outputChannels: 2,
+            sampleRate: 48000
+        )
+        XCTAssertTrue(multiOutput.isMultiOutput)
+        XCTAssertFalse(standardDevice.isMultiOutput)
+    }
+    
+    func testMultiOutputHandling() {
+        let devices = CoreAudioHelper.getAllDevices()
+        if let multiOutput = devices.first(where: { $0.isMultiOutput }) {
+            let subUIDs = CoreAudioHelper.getSubDeviceUIDs(for: multiOutput.deviceID)
+            XCTAssertFalse(subUIDs.isEmpty, "Multi-Output device should have unpacked subdevices.")
+            
+            if let inputDev = devices.first(where: { $0.inputChannels > 0 }) {
+                let aggID = CoreAudioHelper.createAggregateDevice(
+                    inputUID: inputDev.uid,
+                    outputUID: multiOutput.uid
+                )
+                XCTAssertNotNil(aggID, "Aggregate device creation with Multi-Output should succeed.")
+                if let id = aggID {
+                    _ = CoreAudioHelper.destroyAggregateDevice(id)
+                }
+            }
+        } else {
+            let result = CoreAudioHelper.createAggregateDevice(
+                inputUID: "BuiltInMicrophoneDevice",
+                outputUID: "~:AMS2_StackedOutput:9999"
+            )
+            XCTAssertNil(result, "Non-existent Multi-Output device should fail gracefully.")
+        }
+    }
 }
